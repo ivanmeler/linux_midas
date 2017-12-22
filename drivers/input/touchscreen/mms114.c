@@ -10,6 +10,7 @@
 #include <linux/module.h>
 #include <linux/delay.h>
 #include <linux/of.h>
+#include <linux/of_device.h>
 #include <linux/i2c.h>
 #include <linux/input/mt.h>
 #include <linux/input/touchscreen.h>
@@ -33,6 +34,9 @@
 #define MMS114_INFOMATION		0x10
 #define MMS114_TSP_REV			0xF0
 
+#define MMS152_FW_REV			0xE1
+#define MMS152_COMPAT_GROUP		0xF2
+
 /* Minimum delay time is 50us between stop and start signal of i2c */
 #define MMS114_I2C_DELAY		50
 
@@ -50,6 +54,11 @@
 #define MMS114_TYPE_TOUCHSCREEN		1
 #define MMS114_TYPE_TOUCHKEY		2
 
+enum mms_type {
+    TYPE_MMS114,
+    TYPE_MMS152,
+};
+
 struct mms114_data {
 	struct i2c_client	*client;
 	struct input_dev	*input_dev;
@@ -58,6 +67,7 @@ struct mms114_data {
 	struct touchscreen_properties props;
 	unsigned int contact_threshold;
 	unsigned int moving_threshold;
+	enum mms_type type;
 
 	/* Use cache data for mode control register(write only) */
 	u8			cache_mode_control;
@@ -241,12 +251,27 @@ static int mms114_get_version(struct mms114_data *data)
 	u8 buf[6];
 	int error;
 
-	error = __mms114_read_reg(data, MMS114_TSP_REV, 6, buf);
-	if (error < 0)
+	switch (data->type) {
+	case TYPE_MMS152:
+	    error = __mms114_read_reg(data, MMS152_FW_REV, 3, buf);
+	    if (error < 0)
 		return error;
+	    buf[3] = i2c_smbus_read_byte_data(data->client,
+		    MMS152_COMPAT_GROUP);
+	    if (buf[3] < 0)
+		return buf[3];
+	    dev_info(dev, "TSP FW Rev: bootloader 0x%x / core 0x%x / config 0x%x, Compat group: %c\n",
+		    buf[0], buf[1], buf[2], buf[3]);
+	    break;
+	case TYPE_MMS114:
+	    error = __mms114_read_reg(data, MMS114_TSP_REV, 6, buf);
+	    if (error < 0)
+		    return error;
 
-	dev_info(dev, "TSP Rev: 0x%x, HW Rev: 0x%x, Firmware Ver: 0x%x\n",
-		 buf[0], buf[1], buf[3]);
+	    dev_info(dev, "TSP Rev: 0x%x, HW Rev: 0x%x, Firmware Ver: 0x%x\n",
+		     buf[0], buf[1], buf[3]);
+	    break;
+	}
 
 	return 0;
 }
@@ -260,6 +285,10 @@ static int mms114_setup_regs(struct mms114_data *data)
 	error = mms114_get_version(data);
 	if (error < 0)
 		return error;
+
+	if (data->type == TYPE_MMS152)
+	    /* MMS152 has no configuration or power on registers */
+	    return 0;
 
 	error = mms114_set_active(data, true);
 	if (error < 0)
@@ -413,6 +442,7 @@ static int mms114_probe(struct i2c_client *client,
 	}
 
 	data->client = client;
+	data->type = (enum mms_type)of_device_get_match_data(&client->dev);
 
 	input_set_capability(input_dev, EV_KEY, BTN_TOUCH);
 	input_set_capability(input_dev, EV_ABS, ABS_MT_POSITION_X);
@@ -426,28 +456,36 @@ static int mms114_probe(struct i2c_client *client,
 		/* No valid legacy binding found, try the common one */
 		touchscreen_parse_properties(input_dev, true, &data->props);
 
-		/* The firmware handles movement and pressure fuzz, so
-		 * don't duplicate that in software.
-		 */
-		data->moving_threshold =
-			input_dev->absinfo[ABS_MT_POSITION_X].fuzz;
-		data->contact_threshold =
-			input_dev->absinfo[ABS_MT_PRESSURE].fuzz;
+		if (data->type == TYPE_MMS114) {
+			/* The firmware handles movement and pressure fuzz, so
+			 * don't duplicate that in software.
+			 */
+			data->moving_threshold =
+				input_dev->absinfo[ABS_MT_POSITION_X].fuzz;
+			data->contact_threshold =
+				input_dev->absinfo[ABS_MT_PRESSURE].fuzz;
 
-		input_dev->absinfo[ABS_MT_POSITION_X].fuzz = 0;
-		input_dev->absinfo[ABS_MT_POSITION_Y].fuzz = 0;
-		input_dev->absinfo[ABS_MT_PRESSURE].fuzz = 0;
+			input_dev->absinfo[ABS_MT_POSITION_X].fuzz = 0;
+			input_dev->absinfo[ABS_MT_POSITION_Y].fuzz = 0;
+			input_dev->absinfo[ABS_MT_PRESSURE].fuzz = 0;
+		}
 	} else {
 		input_set_abs_params(input_dev, ABS_MT_POSITION_X,
 				0, data->props.max_x, 0, 0);
 		input_set_abs_params(input_dev, ABS_MT_POSITION_Y,
 				0, data->props.max_y, 0, 0);
-
 	}
 
 	data->input_dev = input_dev;
 
-	input_dev->name = "MELFAS MMS114 Touchscreen";
+	switch (data->type) {
+	    case TYPE_MMS114:
+		input_dev->name = "MELFAS MMS114 Touchscreen";
+		break;
+	    case TYPE_MMS152:
+		input_dev->name = "MELFAS MMS152 Touchscreen";
+		break;
+	}
 	input_dev->id.bustype = BUS_I2C;
 	input_dev->dev.parent = &client->dev;
 	input_dev->open = mms114_input_open;
@@ -543,12 +581,19 @@ static SIMPLE_DEV_PM_OPS(mms114_pm_ops, mms114_suspend, mms114_resume);
 
 static const struct i2c_device_id mms114_id[] = {
 	{ "mms114", 0 },
+	{ "mms152", 0 },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, mms114_id);
 
 static const struct of_device_id mms114_dt_match[] = {
-	{ .compatible = "melfas,mms114" },
+	{
+	    .compatible = "melfas,mms114",
+	    .data = (void *)TYPE_MMS114,
+	}, {
+	    .compatible = "melfas,mms152",
+	    .data = (void *)TYPE_MMS152,
+	},
 	{ }
 };
 MODULE_DEVICE_TABLE(of, mms114_dt_match);
